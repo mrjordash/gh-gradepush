@@ -1,0 +1,442 @@
+#!/usr/bin/env node
+"use strict";
+
+const { createHash } = require("node:crypto");
+const { lstatSync, mkdirSync, readFileSync, realpathSync, statSync, statfsSync } = require("node:fs");
+const path = require("node:path");
+const { spawn } = require("node:child_process");
+
+const VERSION = "1.0.0";
+const MAX_MANIFEST_BYTES = 1024 * 1024;
+const MAX_ASSIGNMENTS = 500;
+const MAX_SUBMISSIONS = 5000;
+const MAX_OUTPUT_BYTES = 64 * 1024;
+const MAX_REPOSITORY_KIB = 250 * 1024;
+const MAX_TOTAL_KIB = 5 * 1024 * 1024;
+const MIN_FREE_BYTES = 512n * 1024n * 1024n;
+const COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
+const GLOBAL_RUNTIME_MS = 30 * 60 * 1000;
+const runtimeDeadline = Date.now() + GLOBAL_RUNTIME_MS;
+
+function usage(code = 0) {
+  const text = [
+    "Usage:",
+    "  gh gradepush clone <manifest-file> [--destination DIR] [--update] [--latest]",
+    "",
+    "Clone GitHub-backed Gradepush submissions from a clone-manifest v1 file.",
+    "",
+    "Options:",
+    "  --destination DIR  Parent directory (default: ./gradepush-submissions)",
+    "  --update           Update matching, clean existing Git repositories only",
+    "  --latest           Use each repository's default branch instead of its recorded SHA",
+    "  --help             Show this help",
+    "  --version          Show the extension version",
+    "",
+    "Prerequisites: authenticated GitHub CLI (gh) and Git must be available on PATH.",
+    "",
+  ].join("\n");
+  (code === 0 ? process.stdout : process.stderr).write(text);
+  process.exit(code);
+}
+
+function invalid(message) {
+  throw new Error(message);
+}
+
+function ownObject(value, keys, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) invalid(label + " must be an object");
+  const actual = Object.keys(value).sort();
+  const expected = [...keys].sort();
+  if (actual.length !== expected.length || actual.some((key, index) => key !== expected[index])) {
+    invalid(label + " has unexpected or missing fields");
+  }
+  return value;
+}
+
+function allowedObject(value, required, optional, label) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) invalid(label + " must be an object");
+  const allowed = new Set([...required, ...optional]);
+  if (required.some((key) => !Object.prototype.hasOwnProperty.call(value, key)) || Object.keys(value).some((key) => !allowed.has(key))) {
+    invalid(label + " has unexpected or missing fields");
+  }
+  return value;
+}
+
+function text(value, label, max) {
+  if (typeof value !== "string" || !value || value.length > max || /[\u0000-\u001f\u007f]/.test(value)) {
+    invalid(label + " must be a non-empty string of at most " + max + " characters");
+  }
+  return value;
+}
+
+function nullableText(value, label, max) {
+  return value === null ? null : text(value, label, max);
+}
+
+function slug(value, label) {
+  const result = text(value, label, 64);
+  if (!/^[a-z0-9][a-z0-9-]{0,63}$/.test(result)) invalid(label + " must be a lowercase URL slug");
+  return result;
+}
+
+function login(value, label) {
+  const result = text(value, label, 39);
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?$/.test(result)) invalid(label + " is not a GitHub login");
+  return result;
+}
+
+function repo(value, label) {
+  const result = text(value, label, 200);
+  const part = "[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,98}[A-Za-z0-9])?";
+  if (!new RegExp("^" + part + "/" + part + "$").test(result) || result.includes("..")) {
+    invalid(label + " is not an owner/repository GitHub full name");
+  }
+  return result;
+}
+
+function commit(value, label) {
+  if (value === null) return null;
+  const result = text(value, label, 40);
+  if (!/^[0-9a-f]{40}$/.test(result)) invalid(label + " must be a lowercase 40-character Git SHA");
+  return result;
+}
+
+function parseManifest(file) {
+  let size;
+  try { size = statSync(file).size; } catch { invalid("cannot read manifest file: " + file); }
+  if (!Number.isSafeInteger(size) || size < 1 || size > MAX_MANIFEST_BYTES) {
+    invalid("manifest must be between 1 and " + MAX_MANIFEST_BYTES + " bytes");
+  }
+  let source;
+  try { source = JSON.parse(readFileSync(file, "utf8")); } catch { invalid("manifest is not valid JSON"); }
+  const root = ownObject(source, ["schemaVersion", "generatedAt", "classroom", "assignments"], "manifest");
+  if (root.schemaVersion !== 1) invalid("unsupported manifest schemaVersion");
+  const timestamp = text(root.generatedAt, "generatedAt", 40);
+  if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,3})?Z$/.test(timestamp) || Number.isNaN(Date.parse(timestamp))) {
+    invalid("generatedAt must be an ISO-8601 UTC timestamp");
+  }
+  const classroomSource = ownObject(root.classroom, ["id", "name", "slug"], "classroom");
+  const classroom = {
+    id: text(classroomSource.id, "classroom.id", 128),
+    name: text(classroomSource.name, "classroom.name", 160),
+    slug: slug(classroomSource.slug, "classroom.slug"),
+  };
+  if (!Array.isArray(root.assignments) || !root.assignments.length || root.assignments.length > MAX_ASSIGNMENTS) {
+    invalid("assignments must contain 1 to " + MAX_ASSIGNMENTS + " entries");
+  }
+  const ids = new Set();
+  const slugs = new Set();
+  const assignments = root.assignments.map((assignmentSource, assignmentIndex) => {
+    const label = "assignments[" + assignmentIndex + "]";
+    const assignment = ownObject(assignmentSource, ["id", "title", "slug", "submissions"], label);
+    const id = text(assignment.id, label + ".id", 128);
+    const assignmentSlug = slug(assignment.slug, label + ".slug");
+    if (ids.has(id) || slugs.has(assignmentSlug)) invalid("assignment ids and slugs must be unique");
+    ids.add(id);
+    slugs.add(assignmentSlug);
+    if (!Array.isArray(assignment.submissions) || assignment.submissions.length > MAX_SUBMISSIONS) {
+      invalid(label + ".submissions has too many entries");
+    }
+    const submissions = assignment.submissions.map((submissionSource, submissionIndex) => {
+      const submissionLabel = label + ".submissions[" + submissionIndex + "]";
+      const submission = allowedObject(submissionSource, ["student", "source"], ["repoFullName", "lastSyncedSha"], submissionLabel);
+      const studentSource = ownObject(submission.student, ["login", "identifier"], submissionLabel + ".student");
+      const student = {
+        login: login(studentSource.login, submissionLabel + ".student.login"),
+        identifier: nullableText(studentSource.identifier, submissionLabel + ".student.identifier", 128),
+      };
+      if (submission.source !== "github" && submission.source !== "upload") invalid(submissionLabel + ".source is unsupported");
+      if (submission.source === "upload" && (submission.repoFullName !== undefined || submission.lastSyncedSha !== undefined)) {
+        invalid(submissionLabel + " must not contain repository fields for an upload submission");
+      }
+      const repoName = submission.repoFullName === undefined ? null : nullableText(submission.repoFullName, submissionLabel + ".repoFullName", 200);
+      const sha = submission.lastSyncedSha === undefined ? null : commit(submission.lastSyncedSha, submissionLabel + ".lastSyncedSha");
+      if (submission.source === "github" && repoName === null) invalid(submissionLabel + ".repoFullName is required for GitHub submissions");
+      return { student, source: submission.source, repoFullName: repoName === null ? null : repo(repoName, submissionLabel + ".repoFullName"), lastSyncedSha: sha };
+    });
+    return { id, title: text(assignment.title, label + ".title", 200), slug: assignmentSlug, submissions };
+  });
+  return { classroom, assignments };
+}
+
+function folderFor(assignment, submission) {
+  const hash = createHash("sha256")
+    .update(assignment.id + "\u0000" + (submission.student.identifier || "") + "\u0000" + submission.repoFullName)
+    .digest("hex")
+    .slice(0, 12);
+  const identifier = submission.student.identifier === null
+    ? ""
+    : submission.student.identifier
+      .normalize("NFKD")
+      .replace(/[^\x20-\x7e]/g, "")
+      .replace(/[^A-Za-z0-9]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 48);
+  return (identifier ? identifier + "-" : "") + submission.student.login.toLowerCase() + "--" + hash;
+}
+
+function lstatOrNull(candidate) {
+  try {
+    return lstatSync(candidate);
+  } catch (error) {
+    if (error && error.code === "ENOENT") return null;
+    throw error;
+  }
+}
+
+function inside(root, candidate, label) {
+  let resolved;
+  try {
+    resolved = realpathSync.native(candidate);
+  } catch {
+    invalid(label + " cannot be resolved");
+  }
+  const relative = path.relative(root, resolved);
+  if (relative === ".." || relative.startsWith(".." + path.sep) || path.isAbsolute(relative)) {
+    invalid(label + " resolves outside the selected destination");
+  }
+  return resolved;
+}
+
+function directoryInside(root, parent, segment, label) {
+  const candidate = path.join(parent, segment);
+  const before = lstatOrNull(candidate);
+  if (!before) mkdirSync(candidate);
+  const resolved = inside(root, candidate, label);
+  if (!lstatSync(resolved).isDirectory()) invalid(label + " is not a directory");
+  return resolved;
+}
+
+function destinationFor(rootInput, classroomSlug, assignmentSlug, studentFolder) {
+  mkdirSync(rootInput, { recursive: true });
+  const root = realpathSync.native(rootInput);
+  if (!lstatSync(root).isDirectory()) invalid("selected destination is not a directory");
+  const classroom = directoryInside(root, root, classroomSlug, "classroom directory");
+  const assignment = directoryInside(root, classroom, assignmentSlug, "assignment directory");
+  const target = path.join(assignment, studentFolder);
+  const existing = lstatOrNull(target);
+  if (!existing) return { root, target, exists: false };
+  const resolved = inside(root, target, "submission directory");
+  if (!lstatSync(resolved).isDirectory()) invalid("submission directory is not a directory");
+  return { root, target: resolved, exists: true };
+}
+
+function restoredCloneTarget(root, target) {
+  const stat = lstatOrNull(target);
+  if (!stat) invalid("gh repo clone did not create the requested directory");
+  const resolved = inside(root, target, "cloned submission directory");
+  if (!lstatSync(resolved).isDirectory()) invalid("cloned submission directory is not a directory");
+  return resolved;
+}
+
+function childEnvironment() {
+  const environment = {
+    GIT_LFS_SKIP_SMUDGE: "1",
+    GIT_TERMINAL_PROMPT: "0",
+    GH_PROMPT_DISABLED: "1",
+  };
+  for (const key of ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TMP", "TEMP", "GH_CONFIG_DIR", "XDG_CONFIG_HOME", "SSH_AUTH_SOCK"]) {
+    if (typeof process.env[key] === "string") environment[key] = process.env[key];
+  }
+  return environment;
+}
+
+function commandTimeout() {
+  const requested = Number.parseInt(process.env.GRADEPUSH_GH_GRADEPUSH_TEST_TIMEOUT_MS || "", 10);
+  const lowerTestTimeout = Number.isSafeInteger(requested) && requested >= 10 && requested < COMMAND_TIMEOUT_MS
+    ? requested
+    : COMMAND_TIMEOUT_MS;
+  const remaining = runtimeDeadline - Date.now();
+  if (remaining <= 0) invalid("global 30-minute runtime limit exceeded");
+  return Math.min(lowerTestTimeout, remaining);
+}
+
+function execute(command, args) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { shell: false, windowsHide: true, env: childEnvironment() });
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const timeoutMs = commandTimeout();
+    const finish = (callback) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      callback();
+    };
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+      finish(() => reject(new Error(command + " timed out after " + timeoutMs + "ms")));
+    }, timeoutMs);
+    child.stdout.on("data", (chunk) => { if (stdout.length < MAX_OUTPUT_BYTES) stdout += chunk; });
+    child.stderr.on("data", (chunk) => { if (stderr.length < MAX_OUTPUT_BYTES) stderr += chunk; });
+    child.on("error", (error) => finish(() => reject(new Error("could not run " + command + ": " + error.message))));
+    child.on("close", (code) => {
+      if (code === 0) finish(() => resolve({ stdout, stderr }));
+      else finish(() => reject(new Error(command + " " + args.join(" ") + " failed" + (stderr.trim() ? ": " + stderr.trim() : ""))));
+    });
+  });
+}
+
+function originName(origin) {
+  const value = origin.trim().replace(/\/+$/, "");
+  const patterns = [
+    /^https:\/\/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?$/i,
+    /^git@github\.com:([^/]+)\/([^/]+?)(?:\.git)?$/i,
+    /^ssh:\/\/git@github\.com\/([^/]+)\/([^/]+?)(?:\.git)?$/i,
+  ];
+  for (const pattern of patterns) {
+    const match = value.match(pattern);
+    if (match) return (match[1] + "/" + match[2]).toLowerCase();
+  }
+  return null;
+}
+
+async function preflight() {
+  try {
+    await execute("gh", ["--version"]);
+    await execute("git", ["--version"]);
+  } catch (error) {
+    invalid("GitHub CLI and Git are required: " + error.message);
+  }
+}
+
+function githubEntries(manifest) {
+  return manifest.assignments.flatMap((assignment) => assignment.submissions
+    .filter((submission) => submission.source === "github")
+    .map((submission) => ({ assignment, submission })));
+}
+
+function declaredSizeKib(value, repoName) {
+  const trimmed = value.trim();
+  if (!/^\d+$/.test(trimmed)) invalid("GitHub reported an invalid repository size for " + repoName);
+  const size = Number(trimmed);
+  if (!Number.isSafeInteger(size) || size < 0) invalid("GitHub reported an invalid repository size for " + repoName);
+  return size;
+}
+
+async function preflightRepositorySizes(manifest) {
+  let total = 0;
+  for (const entry of githubEntries(manifest)) {
+    const repoName = entry.submission.repoFullName;
+    const response = await execute("gh", ["api", "repos/" + repoName, "--jq", ".size"]);
+    const size = declaredSizeKib(response.stdout, repoName);
+    if (size > MAX_REPOSITORY_KIB) invalid(repoName + " exceeds the 250 MiB repository limit");
+    total += size;
+    if (total > MAX_TOTAL_KIB) invalid("declared GitHub repository sizes exceed the 5 GiB batch limit");
+  }
+}
+
+function preflightFreeDisk(destination) {
+  mkdirSync(destination, { recursive: true });
+  const filesystem = statfsSync(destination);
+  const available = BigInt(filesystem.bavail) * BigInt(filesystem.bsize);
+  if (available < MIN_FREE_BYTES) invalid("destination has less than 512 MiB free");
+}
+
+async function inspectExisting(target, expectedRepo) {
+  const worktree = await execute("git", ["-C", target, "rev-parse", "--is-inside-work-tree"]);
+  if (worktree.stdout.trim() !== "true") invalid(target + " is not a Git worktree");
+  const remote = await execute("git", ["-C", target, "remote", "get-url", "origin"]);
+  if (originName(remote.stdout) !== expectedRepo.toLowerCase()) invalid(target + " has an origin that does not match " + expectedRepo);
+  const status = await execute("git", ["-C", target, "status", "--porcelain"]);
+  if (status.stdout.trim()) invalid(target + " has a dirty worktree");
+  return true;
+}
+
+async function updateDefaultBranch(target) {
+  await execute("git", ["-C", target, "fetch", "--prune", "origin"]);
+  const originHead = await execute("git", ["-C", target, "symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"]);
+  const branch = originHead.stdout.trim().replace(/^origin\//, "");
+  if (!/^[A-Za-z0-9](?:[A-Za-z0-9._/-]*[A-Za-z0-9])?$/.test(branch) || branch.includes("..")) {
+    invalid(target + " has an unsafe default branch");
+  }
+  await execute("git", ["-C", target, "checkout", branch]);
+  await execute("git", ["-C", target, "merge", "--ff-only", "origin/" + branch]);
+}
+
+async function cloneOne(location, submission, options) {
+  let target = location.target;
+  if (location.exists && !options.update) return "already exists, use --update to fetch it";
+  if (options.update && !location.exists) invalid(target + " does not exist; --update requires an existing Git worktree");
+  const existing = options.update ? await inspectExisting(target, submission.repoFullName) : false;
+  if (!existing) {
+    await execute("gh", ["repo", "clone", submission.repoFullName, target, "--", "--filter=blob:none"]);
+    target = restoredCloneTarget(location.root, target);
+  }
+  if (options.latest) {
+    if (existing) await updateDefaultBranch(target);
+    return "cloned latest default branch";
+  }
+  if (existing) await execute("git", ["-C", target, "fetch", "--prune", "origin"]);
+  await execute("git", ["-C", target, "checkout", "--detach", submission.lastSyncedSha]);
+  return "checked out " + submission.lastSyncedSha;
+}
+
+function parseArgs(argv) {
+  if (argv.includes("--help") || argv.includes("-h")) usage();
+  if (argv.includes("--version")) {
+    process.stdout.write(VERSION + "\n");
+    process.exit(0);
+  }
+  if (argv[0] !== "clone" || !argv[1]) usage(64);
+  let destination = path.resolve(process.cwd(), "gradepush-submissions");
+  let update = false;
+  let latest = false;
+  for (let index = 2; index < argv.length; index += 1) {
+    if (argv[index] === "--destination") {
+      if (!argv[index + 1] || argv[index + 1].startsWith("--")) usage(64);
+      destination = path.resolve(process.cwd(), argv[++index]);
+    } else if (argv[index] === "--update") update = true;
+    else if (argv[index] === "--latest") latest = true;
+    else usage(64);
+  }
+  return { manifestFile: argv[1], destination, update, latest };
+}
+
+async function main() {
+  const options = parseArgs(process.argv.slice(2));
+  const manifest = parseManifest(options.manifestFile);
+  await preflight();
+  preflightFreeDisk(options.destination);
+  await preflightRepositorySizes(manifest);
+  let cloned = 0;
+  let skipped = 0;
+  let failed = 0;
+  for (const assignment of manifest.assignments) {
+    for (const submission of assignment.submissions) {
+      const label = assignment.slug + "/" + submission.student.login;
+      if (submission.source === "upload") {
+        skipped += 1;
+        process.stdout.write("SKIP " + label + ": upload-backed submissions cannot be cloned from GitHub\n");
+        continue;
+      }
+      if (submission.lastSyncedSha === null && !options.latest) {
+        skipped += 1;
+        process.stdout.write("SKIP " + label + ": no recorded sync SHA; rerun with --latest to clone the default branch\n");
+        continue;
+      }
+      try {
+        const location = destinationFor(options.destination, manifest.classroom.slug, assignment.slug, folderFor(assignment, submission));
+        const result = await cloneOne(location, submission, options);
+        if (result.startsWith("already exists")) {
+          skipped += 1;
+          process.stdout.write("SKIP " + label + ": " + result + "\n");
+        } else {
+          cloned += 1;
+          process.stdout.write("OK " + label + ": " + result + "\n");
+        }
+      } catch (error) {
+        failed += 1;
+        process.stderr.write("FAIL " + label + ": " + error.message + "\n");
+      }
+    }
+  }
+  process.stdout.write("Summary: " + cloned + " cloned, " + skipped + " skipped, " + failed + " failed.\n");
+  if (failed) process.exitCode = 1;
+}
+
+main().catch((error) => {
+  process.stderr.write("gh-gradepush: " + error.message + "\n");
+  process.exitCode = 1;
+});
