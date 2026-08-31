@@ -4,18 +4,18 @@ gh-gradepush is a local GitHub CLI extension for cloning the GitHub-backed
 submissions listed in a Gradepush clone manifest. It never clones upload-backed
 submissions because they do not have a GitHub remote.
 
-## Local install
+## Install
 
-The extension needs an authenticated GitHub CLI (gh) and Git. During local
-development, symlink this directory into the GitHub CLI extension directory:
+The extension needs an authenticated GitHub CLI (gh) and Git:
+
+    gh extension install mrjordash/gh-gradepush
+
+During local development, symlink this directory into the GitHub CLI extension
+directory:
 
     mkdir -p ~/.local/share/gh/extensions
     ln -s "$(pwd)/tools/gh-gradepush" ~/.local/share/gh/extensions/gh-gradepush
     gh gradepush --help
-
-The planned packaged installation is:
-
-    gh extension install mrjordash/gh-gradepush
 
 ## Clone a manifest
 
