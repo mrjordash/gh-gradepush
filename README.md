@@ -43,8 +43,9 @@ instructs the operator to rerun explicitly with --latest.
 Every GitHub CLI and Git child process runs with LFS smudging disabled and
 interactive prompts disabled. Before cloning, the extension verifies that each
 GitHub repository declares no more than 250 MiB, the batch declares no more
-than 5 GiB, and the destination has at least 512 MiB free. Each command has a
-five-minute limit and the complete run has a 30-minute limit.
+than 5 GiB, and the destination can hold the declared batch with 25% checkout
+overhead plus a 512 MiB safety reserve. Each command and all of its child
+processes have a five-minute limit, and the complete run has a 30-minute limit.
 
 ## Clone manifest v1
 

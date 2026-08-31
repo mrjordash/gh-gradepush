@@ -62,7 +62,13 @@ function fixture() {
     'if (args[0] === "--version") { console.log(name + " fake"); process.exit(0); }',
     'if (name === "gh") {',
     '  if (args[0] === "api") {',
-    '    if (fs.existsSync(path.join(process.env.TMPDIR, "hang-api"))) setInterval(() => {}, 1000);',
+    '    if (fs.existsSync(path.join(process.env.TMPDIR, "hang-api"))) { setInterval(() => {}, 1000); return; }',
+    '    if (fs.existsSync(path.join(process.env.TMPDIR, "hang-api-with-child"))) {',
+    '      const child = require("node:child_process").spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });',
+    '      fs.writeFileSync(path.join(process.env.TMPDIR, "hanging-child-pid"), String(child.pid));',
+    '      setInterval(() => {}, 1000);',
+    '      return;',
+    '    }',
     '    const sizeFile = path.join(process.env.TMPDIR, "api-size");',
     '    process.stdout.write(fs.existsSync(sizeFile) ? fs.readFileSync(sizeFile, "utf8") : "1\\n");',
     '    process.exit(0);',
@@ -290,6 +296,22 @@ test("rejects an aggregate declared size above 5 GiB before any clone starts", (
   }
 });
 
+test("rejects a batch that cannot fit with checkout overhead and the safety reserve", () => {
+  const testFixture = fixture();
+  try {
+    writeFileSync(path.join(testFixture.temporary, "api-size"), "102400\n");
+    const result = testFixture.run(
+      ["clone", testFixture.writeManifest(cloneManifest())],
+      { GRADEPUSH_GH_GRADEPUSH_TEST_FREE_BYTES: String(512 * 1024 * 1024) },
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /does not have enough free space for the declared batch/);
+    assert.equal(testFixture.commands().some((entry) => entry.name === "gh" && entry.args[0] === "repo"), false);
+  } finally {
+    testFixture.cleanup();
+  }
+});
+
 test("times out a hanging GitHub API request before any clone starts", () => {
   const testFixture = fixture();
   try {
@@ -301,6 +323,23 @@ test("times out a hanging GitHub API request before any clone starts", () => {
     assert.equal(result.status, 1);
     assert.match(result.stderr, /gh timed out after 50ms/);
     assert.equal(testFixture.commands().some((entry) => entry.name === "gh" && entry.args[0] === "repo"), false);
+  } finally {
+    testFixture.cleanup();
+  }
+});
+
+test("terminates a timed-out command's descendant process", { skip: process.platform === "win32" }, () => {
+  const testFixture = fixture();
+  try {
+    writeFileSync(path.join(testFixture.temporary, "hang-api-with-child"), "yes\n");
+    const result = testFixture.run(
+      ["clone", testFixture.writeManifest(cloneManifest())],
+      { GRADEPUSH_GH_GRADEPUSH_TEST_TIMEOUT_MS: "500" },
+    );
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /gh timed out after 500ms/);
+    const childPid = Number(readFileSync(path.join(testFixture.temporary, "hanging-child-pid"), "utf8"));
+    assert.throws(() => process.kill(childPid, 0), { code: "ESRCH" });
   } finally {
     testFixture.cleanup();
   }

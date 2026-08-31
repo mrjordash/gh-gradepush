@@ -4,7 +4,7 @@
 const { createHash } = require("node:crypto");
 const { lstatSync, mkdirSync, readFileSync, realpathSync, statSync, statfsSync } = require("node:fs");
 const path = require("node:path");
-const { spawn } = require("node:child_process");
+const { spawn, spawnSync } = require("node:child_process");
 
 const VERSION = "1.0.0";
 const MAX_MANIFEST_BYTES = 1024 * 1024;
@@ -14,6 +14,7 @@ const MAX_OUTPUT_BYTES = 64 * 1024;
 const MAX_REPOSITORY_KIB = 250 * 1024;
 const MAX_TOTAL_KIB = 5 * 1024 * 1024;
 const MIN_FREE_BYTES = 512n * 1024n * 1024n;
+const DISK_OVERHEAD_PERCENT = 25n;
 const COMMAND_TIMEOUT_MS = 5 * 60 * 1000;
 const GLOBAL_RUNTIME_MS = 30 * 60 * 1000;
 const runtimeDeadline = Date.now() + GLOBAL_RUNTIME_MS;
@@ -253,25 +254,62 @@ function commandTimeout() {
 
 function execute(command, args) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { shell: false, windowsHide: true, env: childEnvironment() });
+    const useProcessGroup = process.platform !== "win32";
+    const child = spawn(command, args, {
+      shell: false,
+      windowsHide: true,
+      detached: useProcessGroup,
+      env: childEnvironment(),
+    });
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let timedOut = false;
+    let forceTimer = null;
     const timeoutMs = commandTimeout();
     const finish = (callback) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      if (forceTimer !== null) clearTimeout(forceTimer);
       callback();
     };
     const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      finish(() => reject(new Error(command + " timed out after " + timeoutMs + "ms")));
+      timedOut = true;
+      if (process.platform === "win32") {
+        spawnSync("taskkill", ["/pid", String(child.pid), "/T", "/F"], {
+          windowsHide: true,
+          stdio: "ignore",
+        });
+      } else {
+        try {
+          process.kill(-child.pid, "SIGTERM");
+        } catch (error) {
+          if (error.code !== "ESRCH") {
+            finish(() => reject(new Error("could not terminate timed-out " + command + ": " + error.message)));
+            return;
+          }
+        }
+      }
+      forceTimer = setTimeout(() => {
+        if (process.platform !== "win32") {
+          try {
+            process.kill(-child.pid, "SIGKILL");
+          } catch (error) {
+            if (error.code !== "ESRCH") {
+              finish(() => reject(new Error("could not stop timed-out " + command + ": " + error.message)));
+              return;
+            }
+          }
+        }
+        finish(() => reject(new Error(command + " timed out after " + timeoutMs + "ms")));
+      }, 1000);
     }, timeoutMs);
     child.stdout.on("data", (chunk) => { if (stdout.length < MAX_OUTPUT_BYTES) stdout += chunk; });
     child.stderr.on("data", (chunk) => { if (stderr.length < MAX_OUTPUT_BYTES) stderr += chunk; });
     child.on("error", (error) => finish(() => reject(new Error("could not run " + command + ": " + error.message))));
     child.on("close", (code) => {
+      if (timedOut) return;
       if (code === 0) finish(() => resolve({ stdout, stderr }));
       else finish(() => reject(new Error(command + " " + args.join(" ") + " failed" + (stderr.trim() ? ": " + stderr.trim() : ""))));
     });
@@ -325,13 +363,24 @@ async function preflightRepositorySizes(manifest) {
     total += size;
     if (total > MAX_TOTAL_KIB) invalid("declared GitHub repository sizes exceed the 5 GiB batch limit");
   }
+  return total;
 }
 
-function preflightFreeDisk(destination) {
+function preflightFreeDisk(destination, totalKib) {
   mkdirSync(destination, { recursive: true });
   const filesystem = statfsSync(destination);
-  const available = BigInt(filesystem.bavail) * BigInt(filesystem.bsize);
-  if (available < MIN_FREE_BYTES) invalid("destination has less than 512 MiB free");
+  const actualAvailable = BigInt(filesystem.bavail) * BigInt(filesystem.bsize);
+  const testAvailable = process.env.GRADEPUSH_GH_GRADEPUSH_TEST_FREE_BYTES;
+  const requestedAvailable = typeof testAvailable === "string" && /^\d+$/.test(testAvailable)
+    ? BigInt(testAvailable)
+    : actualAvailable;
+  const available = requestedAvailable < actualAvailable ? requestedAvailable : actualAvailable;
+  const declaredBytes = BigInt(totalKib) * 1024n;
+  const transferAndCheckout = declaredBytes + ((declaredBytes * DISK_OVERHEAD_PERCENT + 99n) / 100n);
+  const required = MIN_FREE_BYTES + transferAndCheckout;
+  if (available < required) {
+    invalid("destination does not have enough free space for the declared batch plus the 512 MiB safety reserve");
+  }
 }
 
 async function inspectExisting(target, expectedRepo) {
@@ -398,8 +447,8 @@ async function main() {
   const options = parseArgs(process.argv.slice(2));
   const manifest = parseManifest(options.manifestFile);
   await preflight();
-  preflightFreeDisk(options.destination);
-  await preflightRepositorySizes(manifest);
+  const totalKib = await preflightRepositorySizes(manifest);
+  preflightFreeDisk(options.destination, totalKib);
   let cloned = 0;
   let skipped = 0;
   let failed = 0;
