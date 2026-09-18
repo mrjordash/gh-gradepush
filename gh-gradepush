@@ -22,9 +22,9 @@ const runtimeDeadline = Date.now() + GLOBAL_RUNTIME_MS;
 function usage(code = 0) {
   const text = [
     "Usage:",
-    "  gh gradepush clone <manifest-file> [--destination DIR] [--update] [--latest]",
+    "  gh gradepush clone <clone-url-or-manifest-file> [--destination DIR] [--update] [--latest]",
     "",
-    "Clone GitHub-backed Gradepush submissions from a clone-manifest v1 file.",
+    "Paste the clone command from Gradepush. Manifest files are also supported.",
     "",
     "Options:",
     "  --destination DIR  Parent directory (default: ./gradepush-submissions)",
@@ -108,8 +108,12 @@ function parseManifest(file) {
   if (!Number.isSafeInteger(size) || size < 1 || size > MAX_MANIFEST_BYTES) {
     invalid("manifest must be between 1 and " + MAX_MANIFEST_BYTES + " bytes");
   }
+  return parseManifestText(readFileSync(file, "utf8"));
+}
+
+function parseManifestText(contents) {
   let source;
-  try { source = JSON.parse(readFileSync(file, "utf8")); } catch { invalid("manifest is not valid JSON"); }
+  try { source = JSON.parse(contents); } catch { invalid("manifest is not valid JSON"); }
   const root = ownObject(source, ["schemaVersion", "generatedAt", "classroom", "assignments"], "manifest");
   if (root.schemaVersion !== 1) invalid("unsupported manifest schemaVersion");
   const timestamp = text(root.generatedAt, "generatedAt", 40);
@@ -422,6 +426,27 @@ async function cloneOne(location, submission, options) {
   return "checked out " + submission.lastSyncedSha;
 }
 
+async function downloadManifest(input) {
+  const url = new URL(input);
+  if (url.protocol !== "https:" && !(url.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname))) invalid("Clone URLs require HTTPS, except on localhost");
+  if (url.username || url.password || url.pathname !== "/api/cli/clone" || url.search || !url.hash || url.hash.length > 4097) invalid("Invalid clone URL. Copy a new command from Gradepush.");
+  const token = url.hash.slice(1);
+  url.hash = "";
+  let response;
+  try {
+    response = await fetch(url, { headers: { Authorization: "Bearer " + token }, redirect: "error", signal: AbortSignal.timeout(30_000) });
+  } catch { invalid("Cannot reach Gradepush. Check the server URL and connection."); }
+  if (!response.ok) invalid("Clone access expired or unavailable. Generate a new command in Gradepush.");
+  const chunks = [];
+  let size = 0;
+  for await (const chunk of response.body) {
+    size += chunk.length;
+    if (size > MAX_MANIFEST_BYTES) invalid("Clone response exceeds size limit");
+    chunks.push(chunk);
+  }
+  return parseManifestText(Buffer.concat(chunks).toString("utf8"));
+}
+
 function parseArgs(argv) {
   if (argv.includes("--help") || argv.includes("-h")) usage();
   if (argv.includes("--version")) {
@@ -445,7 +470,9 @@ function parseArgs(argv) {
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const manifest = parseManifest(options.manifestFile);
+  const manifest = /^https?:\/\//.test(options.manifestFile)
+    ? await downloadManifest(options.manifestFile)
+    : parseManifest(options.manifestFile);
   await preflight();
   const totalKib = await preflightRepositorySizes(manifest);
   preflightFreeDisk(options.destination, totalKib);

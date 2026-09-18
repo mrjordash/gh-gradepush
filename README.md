@@ -17,7 +17,23 @@ directory:
     ln -s "$(pwd)/tools/gh-gradepush" ~/.local/share/gh/extensions/gh-gradepush
     gh gradepush --help
 
-## Clone a manifest
+## Clone from Gradepush
+
+Open **Clone locally** on a classroom or assignment and paste the generated
+command into your terminal. There is no manifest to download. The command reads
+only the selected classroom or assignment, expires after ten minutes, and checks
+your current teaching access again when used. Keep the command private, including
+in terminal history. Generate another command if it expires. Repository cloning
+still uses your own authenticated GitHub CLI account.
+
+The CLI sends the credential in an Authorization header over HTTPS (HTTP is
+accepted only on localhost), rejects redirects, and limits the response to 1 MiB.
+It does not store the credential or pass it to Git/GitHub subprocesses.
+
+During development, install the local extension above; publishing the extension
+is a separate release step before using these commands with the public install.
+
+## Existing manifest files
 
     gh gradepush clone gradepush-clone-manifest.json
     gh gradepush clone gradepush-clone-manifest.json --destination ./reviews

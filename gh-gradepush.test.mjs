@@ -141,6 +141,49 @@ test("shows help and version without needing gh or git", () => {
   assert.equal(version.stdout.trim(), "1.0.0");
 });
 
+test("fetches a scoped clone URL with a bearer header, without persisting its credential", () => {
+  const f = fixture();
+  try {
+    const preload = path.join(f.temporary, "fetch.cjs");
+    writeFileSync(preload, `global.fetch = async (url, options) => {
+      require('node:assert/strict').equal(String(url), 'https://gradepush.example/api/cli/clone');
+      require('node:assert/strict').equal(options.headers.Authorization, 'Bearer scoped-test-ticket');
+      require('node:assert/strict').equal(options.redirect, 'error');
+      return new Response(${JSON.stringify(JSON.stringify(cloneManifest()))});
+    };`);
+    const result = f.run(["clone", "https://gradepush.example/api/cli/clone#scoped-test-ticket"], { NODE_OPTIONS: `--require=${preload}` });
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /1 cloned/);
+    assert.ok(!JSON.stringify(f.commands()).includes("scoped-test-ticket"));
+    assert.ok(!(result.stdout + result.stderr).includes("scoped-test-ticket"));
+  } finally { f.cleanup(); }
+});
+
+test("rejects insecure remote clone URLs and unexpected endpoints before using GitHub", () => {
+  const f = fixture();
+  try {
+    for (const url of ["http://school.example/api/cli/clone#ticket", "https://school.example/other#ticket", "https://user:password@school.example/api/cli/clone#ticket"]) {
+      const result = f.run(["clone", url]);
+      assert.equal(result.status, 1);
+      assert.equal(f.commands().length, 0);
+      assert.ok(!result.stderr.includes("password"));
+    }
+  } finally { f.cleanup(); }
+});
+
+test("reports expired clone access without exposing the credential", () => {
+  const f = fixture();
+  try {
+    const preload = path.join(f.temporary, "fetch.cjs");
+    writeFileSync(preload, "global.fetch = async () => new Response('{}', { status: 401 });");
+    const result = f.run(["clone", "https://school.example/api/cli/clone#private-ticket"], { NODE_OPTIONS: `--require=${preload}` });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /Generate a new command/);
+    assert.ok(!result.stderr.includes("private-ticket"));
+    assert.equal(f.commands().length, 0);
+  } finally { f.cleanup(); }
+});
+
 test("clones GitHub submissions into a deterministic safe hierarchy at the recorded SHA", () => {
   const testFixture = fixture();
   try {
