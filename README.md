@@ -6,9 +6,13 @@ submissions because they do not have a GitHub remote.
 
 ## Install
 
-The extension needs an authenticated GitHub CLI (gh) and Git:
+The extension needs Node.js 20 or later, an authenticated GitHub CLI (gh), and Git:
 
     gh extension install mrjordash/gh-gradepush
+
+If already installed, update it with `gh extension upgrade gradepush`.
+Saved-session login and named downloads support macOS, Linux, and WSL. Native
+Windows credential storage is not supported yet; use WSL for this workflow.
 
 During local development, symlink this directory into the GitHub CLI extension
 directory:
@@ -19,19 +23,57 @@ directory:
 
 ## Clone from Gradepush
 
-Open **Clone locally** on a classroom or assignment and paste the generated
-command into your terminal. There is no manifest to download. The command reads
-only the selected classroom or assignment, expires after ten minutes, and checks
-your current teaching access again when used. Keep the command private, including
-in terminal history. Generate another command if it expires. Repository cloning
-still uses your own authenticated GitHub CLI account.
+Sign in once on each computer:
 
-The CLI sends the credential in an Authorization header over HTTPS (HTTP is
+    gh gradepush login
+
+This opens Gradepush in your browser. Sign in as a teacher, compare the displayed
+code with your terminal, and select **Authorize this terminal**. Never approve a
+code sent by someone else. Use `--no-browser` to open the printed link yourself,
+or `--server https://your-gradepush.example` for a self-hosted server. The default
+is `https://gradepush.ca`. Login requests expire after ten minutes.
+
+Then download by GitHub organization (or Gradepush workspace slug), classroom,
+and optional assignment:
+
+    gh gradepush download codewithjordy test test
+    gh gradepush download codewithjordy test
+    gh gradepush download codewithjordy test test --destination ./reviews
+    gh gradepush download codewithjordy test test --update
+    gh gradepush download codewithjordy test test --latest
+
+Omit the assignment to download the whole classroom. **Clone locally** in the
+web app provides the commands for the selected classroom or assignment. If the
+same name matches multiple classrooms you teach, add `--workspace <workspace-slug>`.
+The CLI does not guess which classroom you intended. Downloads use the server
+saved during login and recheck your current teaching access every time.
+
+Your session lasts 90 days. To revoke it on the server and remove it locally:
+
+    gh gradepush logout
+
+Log out before switching accounts or servers, or signing in again after expiry.
+Logout requires a connection to the saved server so it can revoke the credential.
+The session is stored in `$XDG_CONFIG_HOME/gradepush/session.json`, or
+`~/.config/gradepush/session.json`, with owner-only file and directory permissions
+on Unix. Keep this file private. The server stores only the credential's SHA-256
+hash. Revoked sessions cannot be reactivated by replaying browser approval.
+Repository cloning still uses your own authenticated GitHub CLI account.
+
+The CLI sends its credential in an Authorization header over HTTPS (HTTP is
 accepted only on localhost), rejects redirects, and limits the response to 1 MiB.
-It does not store the credential or pass it to Git/GitHub subprocesses.
+It never passes the Gradepush credential to Git/GitHub subprocesses or includes
+it in a download command.
 
 During development, install the local extension above; publishing the extension
-is a separate release step before using these commands with the public install.
+and deploying the CLI session migration and application are separate release
+steps before using the new commands with the public install.
+
+## Legacy clone URLs
+
+Previously generated `gh gradepush clone '<url>'` commands continue to work until
+their ten-minute expiry. These commands contain a private, selection-scoped
+credential. The CLI sends it as a bearer header without storing it locally.
 
 ## Existing manifest files
 

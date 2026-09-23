@@ -1,10 +1,12 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
+import { createServer } from "node:http";
+import { request as gradepushRequest, readSession, saveSession } from "./cli-auth.mjs";
 
 const extensionRoot = path.resolve("tools/gh-gradepush");
 const cli = path.join(extensionRoot, "gh-gradepush");
@@ -116,6 +118,7 @@ function fixture() {
           ...process.env,
           PATH: bin + path.delimiter + process.env.PATH,
           HOME: path.join(temporary, "home"),
+          XDG_CONFIG_HOME: path.join(temporary, "config"),
           USER: "gradepush-test",
           LANG: "en_CA.UTF-8",
           TMPDIR: temporary,
@@ -138,7 +141,173 @@ test("shows help and version without needing gh or git", () => {
   assert.equal(help.status, 0);
   assert.match(help.stdout, /gh gradepush clone/);
   assert.equal(version.status, 0);
-  assert.equal(version.stdout.trim(), "1.0.0");
+  assert.equal(version.stdout.trim(), "1.1.0");
+});
+
+test("empty classrooms complete without running Git or creating destination directories", () => {
+  const f = fixture();
+  try {
+    const result = f.run(["clone", f.writeManifest(cloneManifest({ assignments: [] }))]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /No assignments/);
+    assert.equal(f.commands().length, 0);
+    assert.equal(existsSync(path.join(f.temporary, "gradepush-submissions")), false);
+  } finally { f.cleanup(); }
+});
+
+test("saved-session login fails closed on unsupported native Windows storage", () => {
+  const f = fixture();
+  try {
+    const preload = path.join(f.temporary, "windows.cjs");
+    writeFileSync(preload, "Object.defineProperty(process, 'platform', { value: 'win32' });");
+    const result = f.run(["login", "--no-browser"], { NODE_OPTIONS: `--require=${preload}` });
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /macOS, Linux, or WSL/);
+    assert.equal(existsSync(path.join(f.temporary, "config")), false);
+  } finally { f.cleanup(); }
+});
+
+test("browser sign-in persists a private credential, named downloads reuse it, and logout revokes it", () => {
+  const f = fixture();
+  try {
+    const preload = path.join(f.temporary, "login-fetch.cjs");
+    const tokenRecord = path.join(f.temporary, "test-token");
+    const sessionFile = path.join(f.temporary, "config", "gradepush", "session.json");
+    writeFileSync(preload, `
+      const assert = require('node:assert/strict');
+      const fs = require('node:fs');
+      let challenge;
+      global.fetch = async (url, options) => {
+        assert.equal(url.origin, 'https://school.example');
+        assert.equal(options.redirect, 'error');
+        if (url.pathname === '/api/cli/login') {
+          challenge = options.headers['X-Gradepush-Challenge'];
+          assert.match(challenge, /^[a-f0-9]{64}$/);
+          return Response.json({ request: 'cli-login:' + challenge + '.123.test' });
+        }
+        const token = options.headers.Authorization.slice(7);
+        if (url.pathname === '/api/cli/session' && options.method === 'GET') {
+          assert.equal(require('node:crypto').createHash('sha256').update(token).digest('hex'), challenge);
+          fs.writeFileSync(${JSON.stringify(tokenRecord)}, token);
+          return Response.json({ login: 'teacher', expiresAt: '2099-01-01T00:00:00.000Z' });
+        }
+        assert.equal(token, fs.readFileSync(${JSON.stringify(tokenRecord)}, 'utf8'));
+        if (url.pathname === '/api/cli/session' && options.method === 'DELETE') return new Response(null, { status: 204 });
+        assert.equal(url.pathname, '/api/cli/download');
+        assert.equal(url.searchParams.get('organization'), 'school');
+        assert.equal(url.searchParams.get('classroom'), 'programming-1');
+        assert.equal(url.searchParams.get('assignment'), 'loops');
+        assert.equal(url.searchParams.get('workspace'), 'staff');
+        return Response.json(${JSON.stringify(cloneManifest())});
+      };
+    `);
+    const environment = { NODE_OPTIONS: `--require=${preload}` };
+    const loginResult = f.run(["login", "--server", "https://school.example", "--no-browser"], environment);
+    assert.equal(loginResult.status, 0, loginResult.stderr);
+    assert.match(loginResult.stdout, /Confirm this code/);
+    assert.match(loginResult.stdout, /Signed in/);
+    const token = readFileSync(tokenRecord, "utf8");
+    assert.ok(!loginResult.stdout.includes(token));
+    assert.equal(statSync(sessionFile).mode & 0o777, 0o600);
+    assert.equal(statSync(path.dirname(sessionFile)).mode & 0o777, 0o700);
+    const downloaded = f.run(["download", "school", "programming-1", "loops", "--workspace", "staff"], environment);
+    assert.equal(downloaded.status, 0, downloaded.stderr);
+    assert.match(downloaded.stdout, /1 cloned/);
+    assert.ok(!JSON.stringify(f.commands()).includes(token));
+    const loggedOut = f.run(["logout"], environment);
+    assert.equal(loggedOut.status, 0, loggedOut.stderr);
+    assert.equal(existsSync(sessionFile), false);
+    assert.equal(f.run(["download", "school", "programming-1"]).status, 1);
+  } finally { f.cleanup(); }
+});
+
+test("refuses unsafe sign-in hosts and malformed named download arguments", () => {
+  const f = fixture();
+  try {
+    for (const server of ["http://school.example", "https://user:secret@school.example", "https://school.example/other", "https://school.example?x=y"]) {
+      const result = f.run(["login", "--server", server, "--no-browser"]);
+      assert.equal(result.status, 1);
+      assert.ok(!result.stderr.includes("secret"));
+    }
+    assert.equal(f.run(["download", "school", "../bad"]).status, 1);
+    assert.equal(f.run(["download", "school"]).status, 64);
+    assert.equal(f.run(["download", "school", "class", "--workspace"]).status, 64);
+    assert.equal(f.commands().length, 0);
+  } finally { f.cleanup(); }
+});
+
+function savedSession(f) {
+  const directory = path.join(f.temporary, "config", "gradepush");
+  mkdirSync(directory, { recursive: true, mode: 0o700 });
+  const file = path.join(directory, "session.json");
+  writeFileSync(file, JSON.stringify({ server: "https://school.example", token: "a".repeat(64), expiresAt: "2099-01-01T00:00:00.000Z" }), { mode: 0o600 });
+  return file;
+}
+
+test("requires private session storage and retains credentials when server revocation fails", () => {
+  const f = fixture();
+  try {
+    const file = savedSession(f);
+    chmodSync(file, 0o644);
+    const unsafe = f.run(["download", "school", "class"]);
+    assert.equal(unsafe.status, 1);
+    assert.match(unsafe.stderr, /mode 600/);
+    chmodSync(file, 0o600);
+    const preload = path.join(f.temporary, "failed-fetch.cjs");
+    writeFileSync(preload, "global.fetch = async () => new Response('{}', { status: 503 });");
+    const failed = f.run(["logout"], { NODE_OPTIONS: `--require=${preload}` });
+    assert.equal(failed.status, 1);
+    assert.match(failed.stderr, /Could not revoke/);
+    assert.equal(existsSync(file), true);
+    assert.equal(f.commands().length, 0);
+  } finally { f.cleanup(); }
+});
+
+test("handles revoked, ambiguous and oversized named downloads without cloning or exposing secrets", () => {
+  const f = fixture();
+  try {
+    savedSession(f);
+    const preload = path.join(f.temporary, "denied-fetch.cjs");
+    for (const [status, expected] of [[401, /revoked/], [409, /--workspace/], [404, /unavailable/], [200, /unsafe/]]) {
+      writeFileSync(preload, `global.fetch = async () => new Response(${status === 200 ? "'x'.repeat(1024 * 1024 + 1)" : "'{}'"}, { status: ${status} });`);
+      const result = f.run(["download", "school", "class"], { NODE_OPTIONS: `--require=${preload}` });
+      assert.equal(result.status, 1);
+      assert.match(result.stderr, expected);
+      assert.ok(!result.stderr.includes("a".repeat(64)));
+    }
+    assert.equal(f.commands().length, 0);
+  } finally { f.cleanup(); }
+});
+
+test("HTTP transport refuses redirects instead of forwarding the credential", async () => {
+  let forwarded = false;
+  const server = createServer((req, res) => {
+    if (req.url === "/redirect") { res.writeHead(302, { Location: "/secret" }); res.end(); }
+    else { forwarded = true; res.end("{}"); }
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    await assert.rejects(gradepushRequest(`http://127.0.0.1:${server.address().port}`, "/redirect", { token: "a".repeat(64) }), /unsafe/);
+    assert.equal(forwarded, false);
+  } finally { server.closeAllConnections(); await new Promise((resolve) => server.close(resolve)); }
+});
+
+test("session publication never overwrites another login and malformed storage errors redact credentials", () => {
+  const f = fixture();
+  const oldConfigHome = process.env.XDG_CONFIG_HOME;
+  process.env.XDG_CONFIG_HOME = path.join(f.temporary, "config");
+  try {
+    const session = { server: "https://school.example", token: "b".repeat(64), expiresAt: "2099-01-01T00:00:00.000Z" };
+    saveSession(session);
+    assert.throws(() => saveSession({ ...session, token: "c".repeat(64) }), { code: "EEXIST" });
+    assert.equal(readSession().token, session.token);
+    writeFileSync(path.join(process.env.XDG_CONFIG_HOME, "gradepush", "session.json"), '{"token":"' + session.token);
+    assert.throws(() => readSession(), { message: "Invalid Gradepush session file" });
+  } finally {
+    if (oldConfigHome === undefined) delete process.env.XDG_CONFIG_HOME;
+    else process.env.XDG_CONFIG_HOME = oldConfigHome;
+    f.cleanup();
+  }
 });
 
 test("fetches a scoped clone URL with a bearer header, without persisting its credential", () => {

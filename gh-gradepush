@@ -6,7 +6,7 @@ const { lstatSync, mkdirSync, readFileSync, realpathSync, statSync, statfsSync }
 const path = require("node:path");
 const { spawn, spawnSync } = require("node:child_process");
 
-const VERSION = "1.0.0";
+const VERSION = "1.1.0";
 const MAX_MANIFEST_BYTES = 1024 * 1024;
 const MAX_ASSIGNMENTS = 500;
 const MAX_SUBMISSIONS = 5000;
@@ -22,11 +22,16 @@ const runtimeDeadline = Date.now() + GLOBAL_RUNTIME_MS;
 function usage(code = 0) {
   const text = [
     "Usage:",
+    "  gh gradepush login [--server URL] [--no-browser]",
+    "  gh gradepush logout",
+    "  gh gradepush download <org-or-workspace> <classroom> [assignment] [options]",
     "  gh gradepush clone <clone-url-or-manifest-file> [--destination DIR] [--update] [--latest]",
     "",
-    "Paste the clone command from Gradepush. Manifest files are also supported.",
+    "Sign in once, then download by name. Omit assignment for the whole classroom.",
+    "Existing clone URLs and manifest files are also supported.",
     "",
     "Options:",
+    "  --workspace SLUG   Resolve classrooms with the same name in different workspaces",
     "  --destination DIR  Parent directory (default: ./gradepush-submissions)",
     "  --update           Update matching, clean existing Git repositories only",
     "  --latest           Use each repository's default branch instead of its recorded SHA",
@@ -126,8 +131,8 @@ function parseManifestText(contents) {
     name: text(classroomSource.name, "classroom.name", 160),
     slug: slug(classroomSource.slug, "classroom.slug"),
   };
-  if (!Array.isArray(root.assignments) || !root.assignments.length || root.assignments.length > MAX_ASSIGNMENTS) {
-    invalid("assignments must contain 1 to " + MAX_ASSIGNMENTS + " entries");
+  if (!Array.isArray(root.assignments) || root.assignments.length > MAX_ASSIGNMENTS) {
+    invalid("assignments must be an array of at most " + MAX_ASSIGNMENTS + " entries");
   }
   const ids = new Set();
   const slugs = new Set();
@@ -453,26 +458,54 @@ function parseArgs(argv) {
     process.stdout.write(VERSION + "\n");
     process.exit(0);
   }
-  if (argv[0] !== "clone" || !argv[1]) usage(64);
+  if (argv[0] === "login") {
+    let server;
+    let browser = true;
+    for (let index = 1; index < argv.length; index += 1) {
+      if (argv[index] === "--server" && argv[index + 1] && !argv[index + 1].startsWith("--")) server = argv[++index];
+      else if (argv[index] === "--no-browser") browser = false;
+      else usage(64);
+    }
+    return { command: "login", server, browser };
+  }
+  if (argv[0] === "logout" && argv.length === 1) return { command: "logout" };
+  if (!["clone", "download"].includes(argv[0]) || !argv[1]) usage(64);
+  let argumentIndex = 2;
+  let target;
+  if (argv[0] === "download") {
+    if (!argv[2] || argv[2].startsWith("--")) usage(64);
+    target = { organization: argv[1], classroom: argv[2] };
+    argumentIndex = 3;
+    if (argv[3] && !argv[3].startsWith("--")) { target.assignment = argv[3]; argumentIndex = 4; }
+    for (const value of Object.values(target)) if (!/^[a-zA-Z0-9][a-zA-Z0-9-]{0,63}$/.test(value)) invalid("Use organization, classroom and assignment slugs from Gradepush");
+  }
   let destination = path.resolve(process.cwd(), "gradepush-submissions");
   let update = false;
   let latest = false;
-  for (let index = 2; index < argv.length; index += 1) {
+  for (let index = argumentIndex; index < argv.length; index += 1) {
     if (argv[index] === "--destination") {
       if (!argv[index + 1] || argv[index + 1].startsWith("--")) usage(64);
       destination = path.resolve(process.cwd(), argv[++index]);
-    } else if (argv[index] === "--update") update = true;
+    } else if (argv[index] === "--workspace" && target && /^[a-zA-Z0-9][a-zA-Z0-9-]{0,63}$/.test(argv[index + 1] || "")) target.workspace = argv[++index];
+    else if (argv[index] === "--update") update = true;
     else if (argv[index] === "--latest") latest = true;
     else usage(64);
   }
-  return { manifestFile: argv[1], destination, update, latest };
+  return { command: argv[0], target, manifestFile: argv[1], destination, update, latest };
 }
 
 async function main() {
   const options = parseArgs(process.argv.slice(2));
-  const manifest = /^https?:\/\//.test(options.manifestFile)
+  const cliAuth = await import("./cli-auth.mjs");
+  if (options.command === "login") return cliAuth.login(options.server, { browser: options.browser });
+  if (options.command === "logout") return cliAuth.logout();
+  const manifest = options.command === "download" ? parseManifestText(await cliAuth.download(options.target)) : /^https?:\/\//.test(options.manifestFile)
     ? await downloadManifest(options.manifestFile)
     : parseManifest(options.manifestFile);
+  if (!manifest.assignments.length) {
+    process.stdout.write("No assignments in this classroom.\nSummary: 0 cloned, 0 skipped, 0 failed.\n");
+    return;
+  }
   await preflight();
   const totalKib = await preflightRepositorySizes(manifest);
   preflightFreeDisk(options.destination, totalKib);
