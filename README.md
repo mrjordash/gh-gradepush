@@ -1,8 +1,10 @@
 # gh-gradepush
 
 gh-gradepush is a local GitHub CLI extension for cloning the GitHub-backed
-submissions listed in a Gradepush clone manifest. It never clones upload-backed
-submissions because they do not have a GitHub remote.
+submissions listed in a Gradepush clone manifest. Upload submissions are included
+when the teacher enabled private GitHub backups and the backup matches the latest
+upload. They are cloned at the recorded backup revision. Uploads without a current
+backup remain skipped; the teacher must have GitHub access to the backup repository.
 
 ## Install
 

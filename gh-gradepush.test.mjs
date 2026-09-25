@@ -398,6 +398,18 @@ test("skips an unsynchronized GitHub submission by default without cloning it", 
   }
 });
 
+test("clones an upload backup at its recorded revision", () => {
+  const testFixture = fixture();
+  try {
+    const value = cloneManifest();
+    value.assignments[0].submissions[0].source = "upload";
+    const result = testFixture.run(["clone", testFixture.writeManifest(value)]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /1 cloned, 0 skipped, 0 failed/);
+    assert.equal(testFixture.commands().some((entry) => entry.name === "gh" && entry.args[0] === "repo"), true);
+  } finally { testFixture.cleanup(); }
+});
+
 test("uses latest only when explicitly requested for an unsynchronized GitHub submission", () => {
   const testFixture = fixture();
   try {
@@ -466,7 +478,7 @@ test("rejects unused identity and repository fields in the strict manifest schem
     };
     result = testFixture.run(["clone", testFixture.writeManifest(uploadFields)]);
     assert.equal(result.status, 1);
-    assert.match(result.stderr, /must not contain repository fields for an upload submission/);
+    assert.match(result.stderr, /requires a recorded SHA for an upload backup/);
     assert.deepEqual(testFixture.commands(), []);
   } finally {
     testFixture.cleanup();

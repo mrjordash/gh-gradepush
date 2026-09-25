@@ -156,11 +156,9 @@ function parseManifestText(contents) {
         identifier: nullableText(studentSource.identifier, submissionLabel + ".student.identifier", 128),
       };
       if (submission.source !== "github" && submission.source !== "upload") invalid(submissionLabel + ".source is unsupported");
-      if (submission.source === "upload" && (submission.repoFullName !== undefined || submission.lastSyncedSha !== undefined)) {
-        invalid(submissionLabel + " must not contain repository fields for an upload submission");
-      }
       const repoName = submission.repoFullName === undefined ? null : nullableText(submission.repoFullName, submissionLabel + ".repoFullName", 200);
       const sha = submission.lastSyncedSha === undefined ? null : commit(submission.lastSyncedSha, submissionLabel + ".lastSyncedSha");
+      if (submission.source === "upload" && repoName !== null && sha === null) invalid(submissionLabel + " requires a recorded SHA for an upload backup");
       if (submission.source === "github" && repoName === null) invalid(submissionLabel + ".repoFullName is required for GitHub submissions");
       return { student, source: submission.source, repoFullName: repoName === null ? null : repo(repoName, submissionLabel + ".repoFullName"), lastSyncedSha: sha };
     });
@@ -350,7 +348,7 @@ async function preflight() {
 
 function githubEntries(manifest) {
   return manifest.assignments.flatMap((assignment) => assignment.submissions
-    .filter((submission) => submission.source === "github")
+    .filter((submission) => submission.repoFullName !== null)
     .map((submission) => ({ assignment, submission })));
 }
 
@@ -515,7 +513,7 @@ async function main() {
   for (const assignment of manifest.assignments) {
     for (const submission of assignment.submissions) {
       const label = assignment.slug + "/" + submission.student.login;
-      if (submission.source === "upload") {
+      if (submission.source === "upload" && !submission.repoFullName) {
         skipped += 1;
         process.stdout.write("SKIP " + label + ": upload-backed submissions cannot be cloned from GitHub\n");
         continue;
