@@ -1,10 +1,17 @@
 # gh-gradepush
 
-gh-gradepush is a local GitHub CLI extension for cloning the GitHub-backed
-submissions listed in a Gradepush clone manifest. Upload submissions are included
-when the teacher enabled private GitHub backups and the backup matches the latest
-upload. They are cloned at the recorded backup revision. Uploads without a current
-backup remain skipped; the teacher must have GitHub access to the backup repository.
+gh-gradepush is a local GitHub CLI extension for downloading the submissions
+in a Gradepush classroom or assignment. GitHub submissions are cloned with your
+own GitHub login. Since version 1.2.0, `gh gradepush download` also downloads
+file-upload submissions (files and ZIPs handed in through Gradepush) directly
+from Gradepush, with or without a GitHub backup.
+
+**Upgrade required for file uploads.** Versions 1.1.0 and earlier print
+`SKIP ...: upload-backed submissions cannot be cloned from GitHub` for every
+upload without a current GitHub backup. Run `gh extension upgrade gradepush`,
+check `gh gradepush --version` reports 1.2.0 or later, and run the same
+download command again. To get one student's files without the CLI, use the
+**ZIP** button next to the submission in Gradepush.
 
 ## Install
 
@@ -70,6 +77,25 @@ it in a download command.
 During development, install the local extension above; publishing the extension
 and deploying the CLI session migration and application are separate release
 steps before using the new commands with the public install.
+
+### File-upload submissions
+
+Each upload submission is stored as a Git repository on the Gradepush server.
+`download` fetches it as a Git bundle over the same signed-in HTTPS session
+(limited to 250 MiB per submission) and creates a local repository in the same
+hierarchy as GitHub submissions, checked out detached at the latest submitted
+revision. The local copy has no remote; its history is kept on the
+`gradepush-latest` branch. `--update` replaces nothing: it only fetches a fresh
+bundle into a clean copy previously created for the same submission. Students
+who have not uploaded files yet are reported as skipped.
+
+Downloaded submissions are untrusted student content, like any cloned
+repository: review them before running scripts, and be careful with editors or
+tools that run project configuration automatically (for example `.envrc` or
+workspace tasks).
+
+Manifest files and legacy clone URLs cannot authenticate to Gradepush, so they
+still skip upload submissions; use `download` for those.
 
 ## Legacy clone URLs
 
@@ -147,4 +173,12 @@ The input is JSON smaller than 1 MiB, with no unrecognized fields:
     }
 
 repoFullName is required for source github. lastSyncedSha may be null or
-omitted. Upload entries are reported as skipped, not treated as failures.
+omitted. An upload entry with repoFullName and lastSyncedSha is a GitHub
+backup and is cloned like a GitHub submission. Other upload entries are
+reported as skipped, not treated as failures.
+
+Version 1.2.0 sends `X-Gradepush-Capabilities: upload-bundles` with `download`.
+Only then does the server add `submissionId` (and the latest submitted
+`lastSyncedSha`, which may be null) to every upload entry instead of a backup
+repository. Clients without the capability keep receiving the entries above,
+because they reject unknown fields.

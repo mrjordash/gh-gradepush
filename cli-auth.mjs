@@ -126,16 +126,69 @@ async function logout() {
   process.stdout.write("Signed out of Gradepush. This CLI session has been revoked.\n");
 }
 
-async function download(target) {
+function activeSession() {
   const session = readSession();
   if (!session || Date.parse(session.expiresAt) <= Date.now()) throw new Error("Run gh gradepush login to sign in (logout first if your saved session expired).");
+  return session;
+}
+
+async function download(target, capabilities = []) {
+  const session = activeSession();
   const query = new URLSearchParams();
   for (const [key, value] of Object.entries(target)) if (value !== undefined) query.set(key, value);
-  const response = await request(session.server, "/api/cli/download?" + query, { token: session.token });
+  const headers = capabilities.length ? { "X-Gradepush-Capabilities": capabilities.join(",") } : {};
+  const response = await request(session.server, "/api/cli/download?" + query, { token: session.token, headers });
   if (response.status === 401) throw new Error("Gradepush sign-in expired or was revoked. Run gh gradepush logout, then gh gradepush login.");
   if (response.status === 409) throw new Error("More than one classroom matches. Add --workspace <workspace-slug>.");
   if (response.status !== 200) throw new Error("Classroom or assignment unavailable. Check the names and your teaching access in Gradepush.");
   return response.body;
 }
 
-export { serverOrigin, readSession, saveSession, request, login, logout, download };
+const MAX_BUNDLE_BYTES = 250 * 1024 * 1024;
+const BUNDLE_TIMEOUT_MS = 5 * 60_000;
+
+// Streams one upload submission's Git bundle to a new private file. The
+// credential is sent only to the saved server and never reaches Git.
+async function downloadSubmissionBundle(submissionId, file, reserve = () => {}) {
+  if (!/^[A-Za-z0-9_-]{1,64}$/.test(submissionId)) throw new Error("Invalid submission id");
+  const session = activeSession();
+  let response;
+  try {
+    response = await fetch(new URL("/api/cli/submissions/" + submissionId + "/bundle", session.server), {
+      headers: { Authorization: "Bearer " + session.token },
+      redirect: "error",
+      signal: AbortSignal.timeout(BUNDLE_TIMEOUT_MS),
+    });
+  } catch {
+    throw new Error("Cannot reach Gradepush or response was unsafe. Check the server URL and connection.");
+  }
+  if (response.status === 401) throw new Error("Gradepush sign-in expired or was revoked. Run gh gradepush logout, then gh gradepush login.");
+  if (response.status !== 200 || !response.body) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error("upload download unavailable (HTTP " + response.status + "); check your teaching access in Gradepush");
+  }
+  // Gradepush states the bundle size in its own header: Content-Length may be
+  // removed or changed by a proxy or compression, while fetch decodes the body.
+  const declared = Number(response.headers.get("x-gradepush-bundle-size"));
+  if (!Number.isSafeInteger(declared) || declared < 1 || declared > MAX_BUNDLE_BYTES) {
+    await response.body.cancel().catch(() => {});
+    throw new Error("upload download is missing a valid size or exceeds the 250 MiB limit");
+  }
+  reserve(declared);
+  const handle = fs.openSync(file, "wx", 0o600);
+  let size = 0;
+  try {
+    for await (const chunk of response.body) {
+      size += chunk.length;
+      if (size > declared) throw new Error("upload download exceeded its declared size");
+      fs.writeSync(handle, chunk);
+    }
+  } catch (error) {
+    throw error instanceof Error && error.message.startsWith("upload download") ? error : new Error("upload download was interrupted; retry the command");
+  } finally {
+    fs.closeSync(handle);
+  }
+  if (size !== declared) throw new Error("upload download was incomplete; retry the command");
+}
+
+export { serverOrigin, readSession, saveSession, request, login, logout, download, downloadSubmissionBundle };

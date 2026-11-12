@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
@@ -141,7 +141,7 @@ test("shows help and version without needing gh or git", () => {
   assert.equal(help.status, 0);
   assert.match(help.stdout, /gh gradepush clone/);
   assert.equal(version.status, 0);
-  assert.equal(version.stdout.trim(), "1.1.0");
+  assert.equal(version.stdout.trim(), "1.2.0");
 });
 
 test("empty classrooms complete without running Git or creating destination directories", () => {
@@ -423,7 +423,7 @@ test("uses latest only when explicitly requested for an unsynchronized GitHub su
     const result = testFixture.run(["clone", testFixture.writeManifest(value), "--latest"]);
     assert.equal(result.status, 0, result.stderr);
     assert.match(result.stdout, /cloned latest default branch/);
-    assert.match(result.stdout, /upload-backed submissions cannot be cloned/);
+    assert.match(result.stdout, /grace: upload submissions download from Gradepush; use gh gradepush download/);
     assert.match(result.stdout, /1 cloned, 1 skipped, 0 failed/);
     assert.equal(testFixture.commands().some((entry) => entry.args.includes("--detach")), false);
     const clone = testFixture.commands().find((entry) => entry.name === "gh" && entry.args[0] === "repo");
@@ -625,4 +625,140 @@ test("rejects a classroom symlink that resolves outside the chosen destination",
   } finally {
     testFixture.cleanup();
   }
+});
+
+function realGit(cwd, ...args) {
+  const result = spawnSync("git", ["-c", "commit.gpgsign=false", "-c", "user.name=Upload", "-c", "user.email=upload@example.test", ...args], { cwd, encoding: "utf8" });
+  assert.equal(result.status, 0, result.stderr);
+  return result.stdout.trim();
+}
+
+// A real server-side upload repository, exported as the Git bundle Gradepush serves.
+function uploadRepository(f) {
+  const source = path.join(f.temporary, "upload-source");
+  mkdirSync(source);
+  realGit(source, "init", "-q", "-b", "main");
+  writeFileSync(path.join(source, "index.html"), "<h1>TP 3</h1>\n");
+  realGit(source, "add", "index.html");
+  realGit(source, "commit", "-q", "-m", "Upload");
+  const bundle = path.join(f.temporary, "upload.bundle");
+  const exportBundle = () => { rmSync(bundle, { force: true }); realGit(source, "bundle", "create", "-q", bundle, "refs/heads/main"); };
+  exportBundle();
+  return {
+    source,
+    bundle,
+    head: () => realGit(source, "rev-parse", "HEAD"),
+    commit(name, content) { writeFileSync(path.join(source, name), content); realGit(source, "add", name); realGit(source, "commit", "-q", "-m", "Upload"); exportBundle(); },
+  };
+}
+
+// Mirrors the server: older clients receive the strict v1 manifest without
+// upload download fields; clients that advertise upload bundles receive them.
+function uploadServerPreload(f, repository, { bundleStatus = 200 } = {}) {
+  const preload = path.join(f.temporary, "upload-fetch.cjs");
+  writeFileSync(preload, `
+    const fs = require('node:fs');
+    global.fetch = async (url, options) => {
+      if (options.redirect !== 'error' || options.headers.Authorization !== 'Bearer ${"a".repeat(64)}') return new Response('{}', { status: 401 });
+      if (url.pathname === '/api/cli/download') {
+        const capable = String(options.headers['X-Gradepush-Capabilities'] || '').split(',').includes('upload-bundles');
+        const sha = ${JSON.stringify(repository.head())};
+        return Response.json({
+          schemaVersion: 1, generatedAt: '2026-11-12T12:00:00Z',
+          classroom: { id: 'classroom-1', name: 'Web 3', slug: 'web-3' },
+          assignments: [{ id: 'assignment-1', title: 'TP 3', slug: 'tp-3', submissions: [
+            { student: { login: 'ada', identifier: 'student-1' }, source: 'upload', ...(capable ? { submissionId: 'submission_1', lastSyncedSha: sha } : {}) },
+            { student: { login: 'grace', identifier: null }, source: 'upload', ...(capable ? { submissionId: 'submission_2', lastSyncedSha: null } : {}) },
+          ] }],
+        });
+      }
+      if (url.pathname === '/api/cli/submissions/submission_1/bundle') {
+        if (${bundleStatus} !== 200) return new Response('{}', { status: ${bundleStatus} });
+        const bytes = fs.readFileSync(${JSON.stringify(repository.bundle)});
+        // No Content-Length: proxies and compression may drop it.
+        return new Response(bytes, { headers: { 'X-Gradepush-Bundle-Size': String(bytes.length), 'Content-Type': 'application/x-git-bundle' } });
+      }
+      return new Response('{}', { status: 404 });
+    };
+  `);
+  return { NODE_OPTIONS: `--require=${preload}`, PATH: path.join(f.temporary, "bin") + path.delimiter + process.env.PATH };
+}
+
+function withRealGit(f) {
+  rmSync(path.join(f.temporary, "bin", "git"));
+}
+
+test("named downloads fetch upload submissions from Gradepush without a GitHub backup", () => {
+  const f = fixture();
+  try {
+    withRealGit(f);
+    savedSession(f);
+    const repository = uploadRepository(f);
+    const environment = uploadServerPreload(f, repository);
+    const result = f.run(["download", "school", "web-3", "tp-3"], environment);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /OK tp-3\/ada: downloaded upload at [0-9a-f]{40}/);
+    assert.match(result.stdout, /SKIP tp-3\/grace: no files uploaded yet/);
+    assert.match(result.stdout, /1 cloned, 1 skipped, 0 failed/);
+    const assignmentDirectory = path.join(f.temporary, "gradepush-submissions", "web-3", "tp-3");
+    const [folderName, ...others] = readdirSync(assignmentDirectory);
+    assert.deepEqual(others, []);
+    assert.match(folderName, /^student-1-ada--[0-9a-f]{12}$/);
+    const target = path.join(assignmentDirectory, folderName);
+    assert.equal(readFileSync(path.join(target, "index.html"), "utf8"), "<h1>TP 3</h1>\n");
+    assert.equal(realGit(target, "rev-parse", "HEAD"), repository.head());
+    assert.equal(realGit(target, "remote"), "");
+    assert.equal(realGit(target, "config", "--get", "gradepush.submission"), "submission_1");
+    assert.equal(f.commands().some((entry) => entry.name === "gh" && entry.args[0] !== "--version"), false);
+    assert.deepEqual(readdirSync(path.join(f.temporary, "gradepush-submissions")).filter((name) => name.endsWith(".bundle")), []);
+    assert.ok(!(result.stdout + result.stderr).includes("a".repeat(64)));
+
+    repository.commit("style.css", "h1 { color: teal; }\n");
+    const unchanged = f.run(["download", "school", "web-3", "tp-3"], uploadServerPreload(f, repository));
+    assert.match(unchanged.stdout, /SKIP tp-3\/ada: already exists, use --update/);
+    const updated = f.run(["download", "school", "web-3", "tp-3", "--update"], uploadServerPreload(f, repository));
+    assert.equal(updated.status, 0, updated.stderr);
+    assert.match(updated.stdout, /OK tp-3\/ada: downloaded upload at/);
+    assert.equal(realGit(target, "rev-parse", "HEAD"), repository.head());
+    assert.equal(readFileSync(path.join(target, "style.css"), "utf8"), "h1 { color: teal; }\n");
+
+    writeFileSync(path.join(target, "notes.txt"), "teacher notes\n");
+    const dirty = f.run(["download", "school", "web-3", "tp-3", "--update"], uploadServerPreload(f, repository));
+    assert.equal(dirty.status, 1);
+    assert.match(dirty.stderr, /FAIL tp-3\/ada: .* has a dirty worktree/);
+  } finally { f.cleanup(); }
+});
+
+test("an unavailable upload download fails only that student and keeps the credential private", () => {
+  const f = fixture();
+  try {
+    withRealGit(f);
+    savedSession(f);
+    const repository = uploadRepository(f);
+    const result = f.run(["download", "school", "web-3", "tp-3"], uploadServerPreload(f, repository, { bundleStatus: 404 }));
+    assert.equal(result.status, 1);
+    assert.match(result.stderr, /FAIL tp-3\/ada: upload download unavailable/);
+    assert.match(result.stdout, /0 cloned, 1 skipped, 1 failed/);
+    assert.ok(!(result.stdout + result.stderr).includes("a".repeat(64)));
+    assert.deepEqual(readdirSync(path.join(f.temporary, "gradepush-submissions", "web-3", "tp-3")), []);
+  } finally { f.cleanup(); }
+});
+
+test("manifest files and legacy clone URLs point upload submissions to named downloads", () => {
+  const f = fixture();
+  try {
+    const value = cloneManifest();
+    value.assignments[0].submissions[0] = { student: { login: "ada", identifier: null }, source: "upload", submissionId: "submission_1", lastSyncedSha: sha };
+    const result = f.run(["clone", f.writeManifest(value)]);
+    assert.equal(result.status, 0, result.stderr);
+    assert.match(result.stdout, /SKIP loops\/ada: upload submissions download from Gradepush; use gh gradepush download/);
+    for (const submissionId of ["../x", "a".repeat(65)]) {
+      value.assignments[0].submissions[0].submissionId = submissionId;
+      assert.equal(f.run(["clone", f.writeManifest(value)]).status, 1);
+    }
+    value.assignments[0].submissions[0] = { student: { login: "ada", identifier: null }, source: "github", repoFullName: "school/loops-ada", submissionId: "submission_1", lastSyncedSha: sha };
+    const github = f.run(["clone", f.writeManifest(value)]);
+    assert.equal(github.status, 1);
+    assert.match(github.stderr, /submissionId is only valid for upload submissions/);
+  } finally { f.cleanup(); }
 });
